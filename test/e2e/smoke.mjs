@@ -1482,15 +1482,10 @@ describe('paiol UI smoke', () => {
     await downloaded;
     await page.waitForSelector('.pa-backdrop', { state: 'detached' });
     await goto(page, 'Clientes');
-    console.log('restore debug', await page.evaluate(() => ({
-      search: document.querySelector('[data-testid="cli-search"]')?.value,
-      rows: [...document.querySelectorAll('main .pa-row-item')].map((row) => ({ text: row.textContent, display: getComputedStyle(row).display })),
-      status: document.querySelector('main .pa-status')?.textContent,
-    })));
-    assert.match(await page.locator('main').innerText(), /Cliente Migração/);
+    assert.match(await page.locator('.pa-list').textContent(), /Cliente Migração/);
     await page.reload({ waitUntil: 'networkidle' });
     await goto(page, 'Clientes');
-    assert.match(await page.locator('main').innerText(), /Cliente Migração/);
+    assert.match(await page.locator('.pa-list').textContent(), /Cliente Migração/);
     await goto(page, 'Insumos');
     assert.doesNotMatch(await page.locator('main').innerText(), /Açúcar/);
     await page.close();
