@@ -11,6 +11,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { DROPBOX_APP_KEY } from '../../src/config.js';
+import { PaiolStore } from '../../src/store.js';
 
 const PORT = 8080;
 const BASE = `http://localhost:${PORT}/`;
@@ -1462,6 +1463,31 @@ describe('paiol UI smoke', () => {
     await page.waitForSelector('.pa-row-item');
     assert.match(await page.textContent('.pa-list'), /Açúcar/);
     assert.deepEqual(errors, [], `console/page errors in built file: ${errors.join(' | ')}`);
+    await page.close();
+  });
+
+  test('a complete YAML backup replaces local data and survives a reload', async () => {
+    const backup = new PaiolStore();
+    backup.state.clients.push({ id: 'client-migration', name: 'Cliente Migração' });
+    const page = await context.newPage();
+    await page.goto(BASE, { waitUntil: 'networkidle' });
+    await goto(page, 'Ajustes');
+    await page.setInputFiles('[data-testid="restore-backup-file"]', {
+      name: 'paiol-backup.yaml', mimeType: 'text/yaml', buffer: Buffer.from(backup.toYaml()),
+    });
+    await page.waitForSelector('[data-testid="restore-backup-confirm"]');
+    assert.match(await page.locator('.pa-sheet').innerText(), /1 cliente\(s\)/);
+    const downloaded = page.waitForEvent('download');
+    await page.click('[data-testid="restore-backup-confirm"]');
+    await downloaded;
+    await page.waitForSelector('.pa-backdrop', { state: 'detached' });
+    await goto(page, 'Clientes');
+    assert.match(await page.locator('main').innerText(), /Cliente Migração/);
+    await page.reload({ waitUntil: 'networkidle' });
+    await goto(page, 'Clientes');
+    assert.match(await page.locator('main').innerText(), /Cliente Migração/);
+    await goto(page, 'Insumos');
+    assert.doesNotMatch(await page.locator('main').innerText(), /Açúcar/);
     await page.close();
   });
 });
