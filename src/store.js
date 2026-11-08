@@ -1,0 +1,655 @@
+// paiol — the business store. The whole business is one in-memory state object that
+// serializes to a single diffable YAML document (§5). Master data is mutable; the
+// money-relevant facts (prices, batches, sales) are append-only immutable events (§2).
+//
+// Local-first: this object is the source of truth. Persistence (IndexedDB / Dropbox) and
+// the UI sit on top; the cost engine reads `toEngineStore()`. Nothing here touches I/O.
+
+import { indexStore } from './cost-engine.js';
+import { toYaml, fromYaml } from './yaml-bridge.js';
+import { isBundleProduct, orderProduction } from './bundles.js';
+import { productIngredientUsage } from './inventory.js';
+
+export const SCHEMA_VERSION = 4;
+
+/** Append-only, immutable event collections (§2.2). */
+const EVENT_COLLECTIONS = ['priceChanges', 'batches', 'sales', 'variableCosts', 'perdas', 'payments', 'despesas', 'incomes', 'financeSettlements', 'cashAdjustments', 'inventoryAdjustments', 'reversals', 'workTimeEvents'];
+/** Mutable master-data collections (§2.1). */
+const BUSINESS_MASTER_COLLECTIONS = ['ingredients', 'recipes', 'products', 'clients', 'employees', 'encomendas', 'comandas', 'categories', 'suppliers', 'cashAccounts', 'financeTitles', 'purchases', 'notifications', 'shoppingItems', 'assets'];
+const MASTER_COLLECTIONS = [...BUSINESS_MASTER_COLLECTIONS, 'trashItems'];
+
+function normalizeProductSaleKind(product) {
+  if (['normal', 'cesta', 'kit', 'combo'].includes(product?.saleKind)) return product;
+  const legacyName = String(product?.name || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  const saleKind = /(^|\s)cesta(\s|$)/.test(legacyName) ? 'cesta'
+    : /(^|\s)kit(\s|$)/.test(legacyName) ? 'kit'
+      : /(^|\s)combo(\s|$)/.test(legacyName) ? 'combo' : 'normal';
+  return { ...product, saleKind };
+}
+
+/**
+ * Seed financial categories (Rev 06) — the user reshapes them freely afterwards. `{name, kind}`
+ * pairs; ids are assigned at seed time (the app seeds these once if `categories` is empty).
+ * @type {Array<{name: string, kind: import('./domain.js').Category['kind']}>}
+ */
+export const DEFAULT_CATEGORIES = [
+  { name: 'Vendas', kind: 'receita' },
+  { name: 'Outras receitas', kind: 'receita' },
+  { name: 'Aluguel', kind: 'despesaFixa' },
+  { name: 'Energia elétrica', kind: 'despesaFixa' },
+  { name: 'Água', kind: 'despesaFixa' },
+  { name: 'Internet', kind: 'despesaFixa' },
+  { name: 'Pró-labore', kind: 'despesaFixa' },
+  { name: 'Matéria-prima', kind: 'despesaVariavel' },
+  { name: 'Embalagens', kind: 'despesaVariavel' },
+  { name: 'Gás', kind: 'despesaVariavel' },
+  { name: 'Frete', kind: 'despesaVariavel' },
+  { name: 'Salários', kind: 'despesaVariavel' },
+  { name: 'Outras', kind: 'despesaVariavel' },
+  { name: 'Custos de produção', kind: 'custo' },
+];
+const ALL = [...MASTER_COLLECTIONS, ...EVENT_COLLECTIONS];
+
+/**
+ * Engine config defaults (§4). Placeholders Nayara tunes in Ajustes; `rateioBase` stays hidden
+ * (§4.3). `custosFixosMes` is the whole monthly fixed pool, DAS included (R$ 82,05 for 2026).
+ * @type {import('./domain.js').Config}
+ */
+export const DEFAULT_CONFIG = {
+  valorHora: 20,                    // BRL/hour of hands-on time
+  taxaGas: 0.10,                    // BRL/minute of oven
+  custosFixosMes: 500,              // monthly fixed pool (rent, internet, DAS, …)
+  expectedActiveMinutesMonth: 2400, // legacy hands-on denominator kept for older backups
+  expectedProductionMinutesMonth: 2400, // monthly production capacity used to allocate fixed costs
+  targetMarginPct: 0.30,
+  paymentFeePct: 0.05,
+  commissionPct: 0,
+  salesTaxPct: 0,               // percentage on sales; MEI DAS stays in fixed costs
+  orderPaymentDueDays: 0,          // default due date: days after the order delivery date
+  settingsHelperInputs: {},          // inputs accepted in each "Calcular comigo" calculator
+  paymentMethods: [
+    { id: 'pix', name: 'Pix' },
+    { id: 'dinheiro', name: 'Dinheiro' },
+    { id: 'cartao-debito', name: 'Cartão de débito' },
+    { id: 'cartao-credito', name: 'Cartão de crédito' },
+    { id: 'transferencia', name: 'Transferência bancária' },
+    { id: 'boleto', name: 'Boleto' },
+    { id: 'outro', name: 'Outro' },
+  ],
+  rateioBase: 'active-time',
+  // Dados da empresa (Rev 06) — she fills these in Ajustes; they appear on the recibo header. Empty
+  // by default (never hardcode real CNPJ/owner). `logo` is a data: URL (PNG/JPG) stored with the data.
+  empresa: { nome: '', cnpj: '', endereco: '', telefone: '', responsavel: '', logo: '' },
+};
+const CONFIG_KEYS = Object.keys(DEFAULT_CONFIG);
+
+/**
+ * @typedef {object} State
+ * @property {number} version
+ * @property {import('./domain.js').Config} config
+ * @property {Record<string, string>} configUpdatedAt
+ * @property {import('./domain.js').Ingredient[]}  ingredients
+ * @property {import('./domain.js').Recipe[]}      recipes
+ * @property {import('./domain.js').Product[]}     products
+ * @property {import('./domain.js').PriceChange[]} priceChanges
+ * @property {import('./domain.js').Batch[]}       batches
+ * @property {import('./domain.js').Sale[]}        sales
+ */
+
+/** @returns {State} a fresh empty state. */
+export function emptyState() {
+  return {
+    version: SCHEMA_VERSION,
+    config: { ...DEFAULT_CONFIG },
+    configUpdatedAt: {},
+    ingredients: [], recipes: [], products: [], clients: [], employees: [], encomendas: [], comandas: [], categories: [],
+    suppliers: [], cashAccounts: [], financeTitles: [], purchases: [], assets: [], trashItems: [],
+    notifications: [], shoppingItems: [],
+    priceChanges: [], batches: [], sales: [], variableCosts: [], perdas: [], payments: [], despesas: [], incomes: [], financeSettlements: [], cashAdjustments: [], inventoryAdjustments: [], reversals: [], workTimeEvents: [],
+  };
+}
+
+export class PaiolStore {
+  /** @param {Partial<State>} [state] */
+  constructor(state) {
+    /** @type {State} */
+    this.state = { ...emptyState(), ...(state || {}) };
+    // Normalize: ensure every collection exists and is an array.
+    for (const c of ALL) if (!Array.isArray(this.state[c])) this.state[c] = [];
+    this.state.version = Math.max(Number(this.state.version) || 1, SCHEMA_VERSION);
+    // Backfill config defaults for any missing key (forward-compatible loads).
+    this.state.config = { ...DEFAULT_CONFIG, ...(this.state.config || {}) };
+    this.state.configUpdatedAt = { ...(this.state.configUpdatedAt || {}) };
+    // Migrate legacy products (recipeId + portion) to the component-list shape.
+    for (const p of this.state.products) {
+      if (!Array.isArray(p.components)) {
+        p.components = p.recipeId ? [{ kind: 'recipe', id: p.recipeId, qty: p.portion ?? 1 }] : [];
+      }
+      delete p.recipeId;
+      delete p.portion;
+      // One-time compatibility for existing catalogs. From now on the type is stored explicitly,
+      // so renaming a product never changes its dashboard classification.
+      if (!p.saleKind) Object.assign(p, normalizeProductSaleKind(p));
+      // Cestas e kits têm embalagem fixa, mas os produtos internos são escolhidos em cada pedido.
+      // Os pedidos antigos já guardam sua própria composição em bundleItems.
+      if (isBundleProduct(p)) p.components = p.components.filter((c) => c.kind !== 'product');
+    }
+    // Read-model memo (§perf): the UI re-renders the whole panel on every action and looks records
+    // up per-row, so id/price scans must be O(1). `_rev` bumps on every mutation; the lazily-built
+    // indexes (and the engine store) are rebuilt only when stale. Not serialized.
+    this._rev = 0;
+    this._index = null; this._indexRev = -1;
+    this._engineStore = null; this._engineRev = -1;
+    this._applyTrashSuppression();
+  }
+
+  /** Lazily-built lookup maps (by-id per master collection + latest price per ingredient). */
+  _idx() {
+    if (this._index && this._indexRev === this._rev) return this._index;
+    const maps = {};
+    for (const c of MASTER_COLLECTIONS) {
+      const m = new Map();
+      for (const x of this.state[c]) m.set(x.id, x);
+      maps[c] = m;
+    }
+    const price = new Map(); // ingredientId → { price, at } of the latest PriceChange (ties: last wins)
+    for (const pc of this.state.priceChanges) {
+      const cur = price.get(pc.ingredientId);
+      if (!cur || pc.at >= cur.at) price.set(pc.ingredientId, { price: pc.price, at: pc.at });
+    }
+    maps.price = price;
+    const reversed = new Set(); // `${kind}:${refId}` for every reversed event (estorno)
+    for (const r of this.state.reversals) reversed.add(`${r.kind}:${r.refId}`);
+    maps.reversed = reversed;
+    this._index = maps; this._indexRev = this._rev;
+    return maps;
+  }
+
+  /** Was this event (a sale/batch/variableCost/perda) reversed by an estorno? */
+  isReversed(kind, id) { return this._idx().reversed.has(`${kind}:${id}`); }
+
+  // ── Config (engine settings; §4) ─────────────────────────────────────────────
+
+  /** @returns {import('./domain.js').Config} */
+  getConfig() { return this.state.config; }
+
+  /** Patch config in place. @param {Partial<import('./domain.js').Config>} partial */
+  setConfig(partial) {
+    const updatedAt = new Date().toISOString();
+    for (const [key, value] of Object.entries(partial)) {
+      this.state.config[key] = value;
+      this.state.configUpdatedAt[key] = updatedAt;
+    }
+    this._rev++;
+    return this.state.config;
+  }
+
+  /** Latest price for an ingredient (BRL per stockUnit), or null if none recorded yet. */
+  currentPrice(ingredientId) {
+    const e = this._idx().price.get(ingredientId);
+    return e ? e.price : null;
+  }
+
+  /** ISO date of the latest recorded price for an ingredient, or null. */
+  lastPriceAt(ingredientId) {
+    const e = this._idx().price.get(ingredientId);
+    return e ? e.at : null;
+  }
+
+  /** Full price history for an ingredient, newest first: [{ at, price }]. */
+  priceHistory(ingredientId) {
+    return this.state.priceChanges
+      .filter((pc) => pc.ingredientId === ingredientId)
+      .map((pc) => ({ at: pc.at, price: pc.price }))
+      .sort((a, b) => (a.at < b.at ? 1 : -1));
+  }
+
+  // ── Master data (mutable upsert/remove) ──────────────────────────────────────
+
+  /** @param {import('./domain.js').Ingredient} x */
+  upsertIngredient(x) { return this._upsertDated('ingredients', x); }
+  /** @param {import('./domain.js').Recipe} x */
+  upsertRecipe(x) { return this._upsertDated('recipes', x); }
+  /** @param {import('./domain.js').Product} x */
+  upsertProduct(x) {
+    const product = normalizeProductSaleKind(x);
+    return this._upsert('products', {
+      ...product,
+      components: isBundleProduct(product) ? (product.components || []).filter((c) => c.kind !== 'product') : product.components,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+  /** @param {import('./domain.js').Cliente} x */
+  upsertClient(x) { return this._upsert('clients', x); }
+  /** @param {object} x */
+  upsertEmployee(x) { return this._upsert('employees', x); }
+  /** @param {import('./domain.js').Encomenda} x */
+  upsertEncomenda(x) {
+    const previousAt = Date.parse(this.get('encomendas', x.id)?.updatedAt || '');
+    const updatedAt = new Date(Math.max(Date.now(), Number.isFinite(previousAt) ? previousAt + 1 : 0)).toISOString();
+    return this._upsert('encomendas', { ...x, updatedAt });
+  }
+  /** @param {import('./domain.js').Comanda} x */
+  upsertComanda(x) {
+    const previous = this.get('comandas', x.id);
+    const itens = (x.itens || []).map((item) => {
+      if (!(Number(item.realizado) > 0)) return item;
+      const prior = previous?.itens?.find((row) => row.productId === item.productId);
+      const usage = item.ingredientUsagePerUnit || prior?.ingredientUsagePerUnit;
+      return { ...item, ingredientUsagePerUnit: usage || Object.fromEntries(productIngredientUsage(this, item.productId)) };
+    });
+    return this._upsertDated('comandas', { ...x, itens });
+  }
+  /** @param {import('./domain.js').Category} x */
+  upsertCategory(x) { return this._upsertDated('categories', x); }
+  /** @param {object} x */
+  upsertSupplier(x) { return this._upsert('suppliers', x); }
+  /** @param {object} x */
+  upsertCashAccount(x) { return this._upsert('cashAccounts', x); }
+  /** @param {object} x */
+  upsertFinanceTitle(x) { return this._upsertDated('financeTitles', x); }
+  /** @param {object} x */
+  upsertPurchase(x) { return this._upsert('purchases', x); }
+  /** @param {object} x */
+  upsertNotification(x) { return this._upsert('notifications', x); }
+  /** @param {object} x */
+  upsertShoppingItem(x) { return this._upsert('shoppingItems', x); }
+  /** Machinery and durable items; purchase stays outside the DRE, depreciation enters over time. */
+  upsertAsset(x) { return this._upsertDated('assets', x); }
+
+  removeIngredient(id, at) { return this._trash('ingredients', id, at); }
+  removeRecipe(id, at) { return this._trash('recipes', id, at); }
+  removeProduct(id, at) { return this._trash('products', id, at); }
+  removeClient(id, at) { return this._trash('clients', id, at); }
+  removeEmployee(id, at) { return this._trash('employees', id, at); }
+  removeEncomenda(id, at) { return this._trash('encomendas', id, at); }
+  removeComanda(id, at) { return this._trash('comandas', id, at); }
+  removeCategory(id, at) { return this._trash('categories', id, at); }
+  /** @param {string} id */
+  removeSupplier(id, at) { return this._trash('suppliers', id, at); }
+  /** @param {string} id */
+  removeCashAccount(id, at) { return this._trash('cashAccounts', id, at); }
+  removeNotification(id, at) { return this._trash('notifications', id, at); }
+  removeShoppingItem(id, at) { return this._trash('shoppingItems', id, at); }
+  removeAsset(id, at) { return this._trash('assets', id, at); }
+
+  /** Deleted master records retained for 30 days, newest first. */
+  activeTrash() {
+    return this.state.trashItems
+      .filter((item) => item.status === 'deleted' && item.record)
+      .slice()
+      .sort((a, b) => String(b.deletedAt).localeCompare(String(a.deletedAt)));
+  }
+
+  /** Restore a deleted record and keep a small sync marker so an older Dropbox copy cannot delete it again. */
+  restoreTrash(itemId, at) {
+    const item = this.get('trashItems', itemId);
+    if (!item || item.status !== 'deleted' || !item.record || !BUSINESS_MASTER_COLLECTIONS.includes(item.collection)) return false;
+    const restored = trashCloneRecord(item.record);
+    const changedAt = trashNormalizeDate(at);
+    this._upsert('trashItems', { ...item, status: 'restored', record: null, updatedAt: changedAt });
+    this._upsert(item.collection, restored);
+    return true;
+  }
+
+  /** Remove expired payloads while retaining only the tombstone required for safe Dropbox sync. */
+  purgeExpiredTrash(now) {
+    const cutoff = trashNormalizeDate(now);
+    let purged = 0;
+    for (const item of this.state.trashItems.slice()) {
+      if (item.status !== 'deleted' || !item.expiresAt || item.expiresAt > cutoff) continue;
+      this._upsert('trashItems', { ...item, status: 'purged', record: null, updatedAt: cutoff });
+      this._hardRemove(item.collection, item.recordId);
+      purged++;
+    }
+    return purged;
+  }
+
+  // ── Events (append-only) ─────────────────────────────────────────────────────
+
+  /** @param {import('./domain.js').PriceChange} ev */
+  addPriceChange(ev) { return this._append('priceChanges', ev); }
+  /** @param {import('./domain.js').Batch} ev */
+  addBatch(ev) { return this._append('batches', ev); }
+  /** @param {import('./domain.js').Sale} ev */
+  addSale(ev) { return this._append('sales', ev); }
+  /** @param {import('./domain.js').VariableCost} ev */
+  addVariableCost(ev) { return this._append('variableCosts', ev); }
+  /** @param {import('./domain.js').Perda} ev */
+  addPerda(ev) { return this._append('perdas', ev); }
+  /** @param {import('./domain.js').Pagamento} ev — a (partial) payment toward an encomenda. */
+  addPayment(ev) { return this._append('payments', ev); }
+  /** @param {import('./domain.js').Despesa} ev — a dated cash expense (fixa/variável via its category). */
+  addDespesa(ev) { return this._append('despesas', ev); }
+  /** Another dated cash income outside order payments. */
+  addIncome(ev) { return this._append('incomes', ev); }
+  /** @param {object} ev */
+  addFinanceSettlement(ev) { return this._append('financeSettlements', ev); }
+  /** @param {object} ev */
+  addCashAdjustment(ev) { return this._append('cashAdjustments', ev); }
+  /** Physical inventory count difference; kept in the event log for audit and sync. */
+  addInventoryAdjustment(ev) { return this._append('inventoryAdjustments', ev); }
+  /** @param {import('./domain.js').Reversal} ev — estorno of a prior event (kind + refId). */
+  addReversal(ev) { return this._append('reversals', ev); }
+  /** Start or end of the observed working day; a reference, not direct recipe labor. */
+  addWorkTimeEvent(ev) { return this._append('workTimeEvents', ev); }
+
+  /** Clear the test orders and expenses while retaining an auditable, restorable history. */
+  clearOrdersAndExpenses(at = new Date().toISOString(), idFactory = () => crypto.randomUUID()) {
+    const orders = this.state.encomendas.slice();
+    const orderIds = new Set(orders.map((order) => order.id));
+    for (const item of this.state.trashItems) if (item.collection === 'encomendas' && item.status === 'deleted') orderIds.add(item.recordId);
+    const cancelledTitles = this.state.financeTitles.filter((title) => title.direction === 'pagar'
+      || (title.sourceType === 'encomenda' && orderIds.has(title.sourceId))
+      || title.sourceType === 'sale');
+    const titleIds = new Set(cancelledTitles.map((title) => title.id));
+    const reverse = (kind, record) => {
+      if (!this.isReversed(kind, record.id)) this.addReversal({ id: idFactory(), at, kind, refId: record.id, reason: 'Limpeza de pedidos e despesas' });
+    };
+    for (const order of orders) this.removeEncomenda(order.id, at);
+    for (const payment of this.state.payments) if (orderIds.has(payment.encomendaId)) reverse('payment', payment);
+    for (const sale of this.state.sales) reverse('sale', sale);
+    for (const expense of this.state.despesas) reverse('despesa', expense);
+    for (const cost of this.state.variableCosts) reverse('variableCost', cost);
+    for (const settlement of this.state.financeSettlements) if (titleIds.has(settlement.titleId)) reverse('financeSettlement', settlement);
+    for (const adjustment of this.state.cashAdjustments) if (adjustment.kind === 'client-payment') {
+      const allocations = this.state.financeSettlements.filter((s) => s.paymentId === adjustment.id && s.kind === 'client-payment-allocation');
+      if (allocations.length && allocations.every((s) => titleIds.has(s.titleId))) reverse('cashAdjustment', adjustment);
+    }
+    for (const title of cancelledTitles) if (!title.cancelledAt) this.upsertFinanceTitle({ ...title, cancelledAt: at });
+    return { orders: orders.length, legacySales: this.state.sales.length, expenses: this.state.despesas.length + this.state.variableCosts.length, payables: cancelledTitles.filter((title) => title.direction === 'pagar').length };
+  }
+
+  /** Total received toward an encomenda (non-reversed payments). Saldo/status derive from this. */
+  paidFor(encomendaId) {
+    let sum = 0;
+    for (const pg of this.state.payments) {
+      if (pg.encomendaId === encomendaId && !this.isReversed('payment', pg.id)) sum += pg.valor || 0;
+    }
+    return sum;
+  }
+
+  /** Sum valid generic settlements for a financial title. */
+  settledFor(titleId) {
+    let sum = 0;
+    for (const st of this.state.financeSettlements) {
+      if (st.titleId === titleId && !this.isReversed('financeSettlement', st.id)) sum += Number(st.amount) || 0;
+    }
+    return sum;
+  }
+
+  /**
+   * Mark an order as a desistência without deleting it. If the day's stored comanda has an explicit
+   * planned quantity, release this order's products from that quantity so already-produced items
+   * immediately become available for sale. Delivery and payment facts remain untouched.
+   */
+  markEncomendaDesistencia(encomendaId, at) {
+    const enc = this.get('encomendas', encomendaId);
+    if (!enc || enc.desistenciaAt) return enc;
+    const date = String(enc.deliveryDate || '').slice(0, 10);
+    const comanda = date ? this.get('comandas', date) : null;
+    if (comanda?.itens?.some((item) => item.prevista != null && item.manualQty == null)) {
+      const cancelled = orderProduction(enc);
+      const itens = comanda.itens.map((item) => item.prevista == null || item.manualQty != null
+        ? item : { ...item, prevista: Math.max(0, Number(item.prevista) - (cancelled.get(item.productId) || 0)) });
+      this.upsertComanda({ ...comanda, itens });
+    }
+    this.upsertEncomenda({ ...enc, desistenciaAt: at });
+
+    // New comanda records store manualQty separately, so their demand falls automatically.
+    return this.get('encomendas', encomendaId);
+  }
+
+  // ── Read model ───────────────────────────────────────────────────────────────
+
+  /** Index the state for the cost engine (memoized until the next mutation). */
+  toEngineStore() {
+    if (this._engineStore && this._engineRev === this._rev) return this._engineStore;
+    this._engineStore = indexStore(this.state);
+    this._engineRev = this._rev;
+    return this._engineStore;
+  }
+
+  /** Get a master record by id, or undefined. O(1) via the memoized index. */
+  get(collection, id) {
+    const m = this._idx()[collection];
+    return m ? m.get(id) : this.state[collection].find((x) => x.id === id);
+  }
+
+  // ── Merge (sync — union by id; §2.2) ─────────────────────────────────────────
+
+  /**
+   * Merge another store/state into this one. Events union by id (immutable, so a shared
+   * id means identical content — duplicates are dropped). Dated master edits use updatedAt
+   * so a stale Dropbox copy cannot undo newly saved data on this device.
+   * @param {PaiolStore | State} other
+   * @returns {{ eventsAdded: number, masterUpserted: number }}
+   */
+  merge(other) {
+    const o = other instanceof PaiolStore ? other.state : other;
+    let eventsAdded = 0;
+    let masterUpserted = 0;
+
+    for (const c of EVENT_COLLECTIONS) {
+      const seen = new Set(this.state[c].map((x) => x.id));
+      for (const ev of o[c] || []) {
+        if (seen.has(ev.id)) continue;
+        seen.add(ev.id);
+        this.state[c].push(ev);
+        eventsAdded++;
+      }
+    }
+    // Trash markers merge by their own timestamp. This must happen before the business records,
+    // otherwise an old Dropbox copy could resurrect something that was deleted on this device.
+    for (const rec of o.trashItems || []) {
+      const local = this.state.trashItems.find((item) => item.id === rec.id);
+      const incomingAt = String(rec.updatedAt || rec.deletedAt || '');
+      const localAt = String((local && (local.updatedAt || local.deletedAt)) || '');
+      if (!local || incomingAt > localAt) { this._upsert('trashItems', rec); masterUpserted++; }
+    }
+    for (const c of BUSINESS_MASTER_COLLECTIONS) {
+      for (const rec of o[c] || []) {
+        if (this._trashBlocks(c, rec.id)) continue;
+        // Legacy records without updatedAt remain compatible: a dated edit wins over them.
+        if (['products', 'encomendas', 'ingredients', 'recipes', 'comandas', 'categories', 'financeTitles', 'assets'].includes(c)) {
+          const local = this.get(c, rec.id);
+          if (local && String(local.updatedAt || '') > String(rec.updatedAt || '')) continue;
+          if (local && JSON.stringify(local) === JSON.stringify(rec)) continue;
+        }
+        if (JSON.stringify(this.get(c, rec.id)) === JSON.stringify(rec)) continue;
+        this._upsert(c, rec);
+        masterUpserted++;
+      }
+    }
+    this._applyTrashSuppression();
+    // Settings merge field by field. A stale Dropbox snapshot must not undo a local edit.
+    // Older backups have no timestamps: keep a non-default local value, but let a fresh
+    // device with defaults adopt the remote value. Stamp the chosen legacy value once.
+    if (o.config) for (const key of CONFIG_KEYS) {
+      if (o.config[key] === undefined) continue;
+      const localAt = String(this.state.configUpdatedAt[key] || '');
+      const remoteAt = String(o.configUpdatedAt?.[key] || '');
+      const localValue = this.state.config[key];
+      const remoteValue = o.config[key];
+      const localJson = JSON.stringify(localValue);
+      const remoteJson = JSON.stringify(remoteValue);
+      if (localAt === remoteAt && localJson === remoteJson) continue;
+      let takeRemote = remoteAt > localAt;
+      if (localAt === remoteAt) {
+        if (localAt) takeRemote = remoteJson > localJson; // deterministic tie-break
+        else takeRemote = localJson === JSON.stringify(DEFAULT_CONFIG[key]) && remoteJson !== JSON.stringify(DEFAULT_CONFIG[key]);
+      }
+      const chosenAt = localAt === remoteAt && !localAt
+        ? new Date().toISOString() : (takeRemote ? remoteAt : localAt);
+      if (takeRemote && localJson !== remoteJson) {
+        this.state.config[key] = remoteValue;
+        masterUpserted++;
+      }
+      if (chosenAt !== localAt) this.state.configUpdatedAt[key] = chosenAt;
+      if ((takeRemote && localJson !== remoteJson) || chosenAt !== localAt) this._rev++;
+    }
+    return { eventsAdded, masterUpserted };
+  }
+
+  // ── Serialization (§5 — one YAML document) ───────────────────────────────────
+
+  /**
+   * @returns {string} canonical strict-YAML of the whole business.
+   * Deterministic regardless of insertion/merge order: collection key order is fixed, events
+   * are sorted chronologically by (at, id), master data by id. This is what makes the file
+   * diff-stable (§5) AND makes sync converge byte-identically across devices — two stores with
+   * the same data serialize to the same bytes.
+   */
+  toYaml() {
+    const ordered = { version: this.state.version, config: orderedConfig(this.state.config), configUpdatedAt: orderedConfigUpdatedAt(this.state.configUpdatedAt) };
+    for (const c of MASTER_COLLECTIONS) ordered[c] = sortBy(this.state[c], byId);
+    for (const c of EVENT_COLLECTIONS) ordered[c] = sortBy(this.state[c], byAtThenId);
+    return toYaml(ordered);
+  }
+
+  /** @param {string} text @returns {PaiolStore} */
+  static fromYaml(text) {
+    return new PaiolStore(/** @type {Partial<State>} */ (fromYaml(text)));
+  }
+
+  /** Replace every business collection after a confirmed full-backup restore. */
+  replaceWith(other) {
+    const incoming = other instanceof PaiolStore ? other : new PaiolStore(other);
+    this.state = structuredClone(incoming.state);
+    this._rev++;
+    this._index = null; this._indexRev = -1;
+    this._engineStore = null; this._engineRev = -1;
+    this._applyTrashSuppression();
+  }
+
+  /** @returns {PaiolStore} a deep-ish copy (records shared; collections fresh). */
+  clone() {
+    const copy = emptyState();
+    copy.version = this.state.version;
+    copy.config = { ...this.state.config };
+    copy.configUpdatedAt = { ...this.state.configUpdatedAt };
+    for (const c of ALL) copy[c] = this.state[c].slice();
+    return new PaiolStore(copy);
+  }
+
+  // ── internals ────────────────────────────────────────────────────────────────
+
+  _upsertDated(collection, rec) {
+    const previousAt = Date.parse(this.get(collection, rec.id)?.updatedAt || '');
+    const updatedAt = new Date(Math.max(Date.now(), Number.isFinite(previousAt) ? previousAt + 1 : 0)).toISOString();
+    return this._upsert(collection, { ...rec, updatedAt });
+  }
+
+  _upsert(collection, rec) {
+    if (!rec || typeof rec.id !== 'string' || !rec.id) {
+      throw new StoreError(`registro de ${collection} precisa de um id`);
+    }
+    const arr = this.state[collection];
+    const i = arr.findIndex((x) => x.id === rec.id);
+    if (i >= 0) arr[i] = rec; else arr.push(rec);
+    this._rev++;
+    return rec;
+  }
+
+  _trash(collection, id, at) {
+    if (!BUSINESS_MASTER_COLLECTIONS.includes(collection)) return false;
+    const arr = this.state[collection];
+    const i = arr.findIndex((x) => x.id === id);
+    if (i < 0) return false;
+    const deletedAt = trashNormalizeDate(at);
+    const record = trashCloneRecord(arr[i]);
+    const trashId = `${collection}:${id}`;
+    this._upsert('trashItems', {
+      id: trashId,
+      collection,
+      recordId: id,
+      label: trashRecordLabel(record),
+      record,
+      deletedAt,
+      expiresAt: trashAddDays(deletedAt, 30),
+      status: 'deleted',
+      updatedAt: deletedAt,
+    });
+    this._hardRemove(collection, id);
+    return true;
+  }
+
+  _trashBlocks(collection, id) {
+    const item = this.state.trashItems.find((entry) => entry.id === `${collection}:${id}`);
+    return !!item && (item.status === 'deleted' || item.status === 'purged');
+  }
+
+  _applyTrashSuppression() {
+    for (const item of this.state.trashItems) {
+      if (item.status === 'deleted' || item.status === 'purged') this._hardRemove(item.collection, item.recordId);
+    }
+  }
+
+  _hardRemove(collection, id) {
+    const arr = this.state[collection];
+    if (!Array.isArray(arr)) return false;
+    const i = arr.findIndex((x) => x.id === id);
+    if (i >= 0) { arr.splice(i, 1); this._rev++; return true; }
+    return false;
+  }
+
+  _append(collection, ev) {
+    if (!ev || typeof ev.id !== 'string' || !ev.id) {
+      throw new StoreError(`evento de ${collection} precisa de um id`);
+    }
+    if (typeof ev.at !== 'string' || !ev.at) {
+      throw new StoreError(`evento de ${collection} precisa de uma data (at)`);
+    }
+    if (this.state[collection].some((x) => x.id === ev.id)) {
+      throw new StoreError(`evento duplicado em ${collection}: ${ev.id}`);
+    }
+    this.state[collection].push(ev);
+    this._rev++;
+    return ev;
+  }
+}
+
+function trashNormalizeDate(value) {
+  const date = value ? new Date(value) : new Date();
+  if (Number.isNaN(date.getTime())) throw new StoreError('data inválida para a lixeira');
+  return date.toISOString();
+}
+
+function trashAddDays(iso, days) {
+  const date = new Date(iso);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString();
+}
+
+function trashCloneRecord(record) {
+  return JSON.parse(JSON.stringify(record));
+}
+
+function trashRecordLabel(record) {
+  return String(record.name || record.description || record.nome || record.date || record.deliveryDate || record.id || 'Registro excluído');
+}
+
+// Deterministic ordering for serialization (does not mutate the live arrays).
+function orderedConfig(config) {
+  const out = {};
+  for (const k of CONFIG_KEYS) if (config[k] !== undefined) out[k] = config[k];
+  return out;
+}
+function orderedConfigUpdatedAt(updatedAt) {
+  const out = {};
+  for (const key of CONFIG_KEYS) if (updatedAt[key]) out[key] = updatedAt[key];
+  return out;
+}
+function sortBy(arr, cmp) { return arr.slice().sort(cmp); }
+function byId(a, b) { return a.id < b.id ? -1 : a.id > b.id ? 1 : 0; }
+function byAtThenId(a, b) {
+  if (a.at !== b.at) return a.at < b.at ? -1 : 1;
+  return byId(a, b);
+}
+
+export class StoreError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'StoreError';
+  }
+}

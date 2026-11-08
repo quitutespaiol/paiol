@@ -1,0 +1,483 @@
+// paiol — cost engine (§4). All costs resolve to BRL per sellable unit.
+//
+// Pure functions over an indexed { ingredients, recipes, products, priceChanges,
+// batches, sales } store plus a Config. The estimate/actuals split (§4.5) is the spine:
+// it lives in a `lens` object the caller supplies, so the SAME engine computes both the
+// pricing view (estimates) and the reporting view (actuals) with no branching inside.
+//
+// Build a lens with estimateLens(config) or actualLens(store, config, {...}).
+
+import { convert } from './units.js';
+
+// ── Store indexing ──────────────────────────────────────────────────────────
+
+/**
+ * @typedef {object} RawStore
+ * @property {import('./domain.js').Ingredient[]}  [ingredients]
+ * @property {import('./domain.js').Recipe[]}      [recipes]
+ * @property {import('./domain.js').Product[]}     [products]
+ * @property {import('./domain.js').PriceChange[]} [priceChanges]
+ * @property {import('./domain.js').Batch[]}       [batches]
+ * @property {import('./domain.js').Sale[]}        [sales]
+ */
+
+/**
+ * Index a raw store into Maps for O(1) lookup. Idempotent-friendly: pass the result
+ * back in and it is returned as-is.
+ * @param {RawStore | Store} raw
+ * @returns {Store}
+ */
+export function indexStore(raw) {
+  if (raw && raw.__indexed) return /** @type {Store} */ (raw);
+  const byId = (arr) => new Map((arr || []).map((x) => [x.id, x]));
+  const priceChanges = (raw.priceChanges || []).slice();
+  // Per-ingredient price history, ascending by time, so priceOf is O(1) for the latest price and
+  // O(history) for an as-of lookup — instead of scanning every price event on every call.
+  const priceHist = new Map();
+  for (const pc of priceChanges) {
+    const arr = priceHist.get(pc.ingredientId);
+    if (arr) arr.push(pc); else priceHist.set(pc.ingredientId, [pc]);
+  }
+  for (const arr of priceHist.values()) arr.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+  return {
+    __indexed: true,
+    ingredients: byId(raw.ingredients),
+    recipes: byId(raw.recipes),
+    products: byId(raw.products),
+    priceChanges,
+    priceHist,
+    batches: (raw.batches || []).slice(),
+    sales: (raw.sales || []).slice(),
+  };
+}
+
+/**
+ * @typedef {object} Store
+ * @property {true} __indexed
+ * @property {Map<string, import('./domain.js').Ingredient>} ingredients
+ * @property {Map<string, import('./domain.js').Recipe>}     recipes
+ * @property {Map<string, import('./domain.js').Product>}    products
+ * @property {import('./domain.js').PriceChange[]}           priceChanges
+ * @property {import('./domain.js').Batch[]}                 batches
+ * @property {import('./domain.js').Sale[]}                  sales
+ */
+
+const ms = (iso) => new Date(iso).getTime();
+
+// ── Prices ──────────────────────────────────────────────────────────────────
+
+/**
+ * The price of an ingredient (BRL per its stockUnit) as of `atMs`. The latest
+ * PriceChange at-or-before `atMs`; if `atMs` is null, the latest of all time.
+ * @param {Store} store
+ * @param {string} ingredientId
+ * @param {number|null} [atMs]
+ * @returns {number}
+ */
+export function priceOf(store, ingredientId, atMs = null) {
+  // Fast path: the per-ingredient history (ascending) is on the indexed store.
+  const hist = store.priceHist && store.priceHist.get(ingredientId);
+  if (hist) {
+    if (atMs == null) return hist[hist.length - 1].price; // history is non-empty by construction
+    let best = null;
+    for (const pc of hist) { if (ms(pc.at) > atMs) break; best = pc; }
+    if (!best) throw new PriceError(ingredientId);
+    return best.price;
+  }
+  // Fallback for a raw (un-indexed) store: scan.
+  let best = null;
+  let bestAt = -Infinity;
+  for (const pc of store.priceChanges || []) {
+    if (pc.ingredientId !== ingredientId) continue;
+    const t = ms(pc.at);
+    if (atMs != null && t > atMs) continue;
+    if (t >= bestAt) { bestAt = t; best = pc; }
+  }
+  if (!best) throw new PriceError(ingredientId);
+  return best.price;
+}
+
+// ── Lenses (estimate vs actual; §4.5) ─────────────────────────────────────────
+
+/**
+ * @typedef {object} Lens
+ * @property {number|null} priceAt                         // null = latest price
+ * @property {(r: import('./domain.js').Recipe) => number} yieldOf
+ * @property {(r: import('./domain.js').Recipe) => { active: number, oven: number, production: number }} timesOf
+ * @property {number} totalActiveMinutesMonth              // fixed-rateio denominator
+ * @property {number} [totalProductionMinutesMonth]        // preferred fixed-rateio denominator
+ */
+
+/**
+ * Pricing lens — drives prices. Nominal yields, recipe phase-time estimates, the
+ * expected monthly active-minute budget.
+ * @param {import('./domain.js').Config} config
+ * @returns {Lens}
+ */
+export function estimateLens(config) {
+  return {
+    priceAt: null,
+    yieldOf: (r) => r.yieldNominal,
+    timesOf: (r) => ({
+      active: Number(r.activeMinutes) || 0,
+      oven: Number(r.ovenMinutes) || 0,
+      production: Number(r.productionMinutes) || (Number(r.activeMinutes) || 0) + (Number(r.ovenMinutes) || 0),
+    }),
+    totalActiveMinutesMonth: config.expectedActiveMinutesMonth,
+    totalProductionMinutesMonth: config.expectedProductionMinutesMonth || config.expectedActiveMinutesMonth,
+  };
+}
+
+/**
+ * Reporting lens — reports reality. Actual yields and phase times from Batch events
+ * (defaulting to the recipe estimate where a batch omits them), and the month's actual
+ * summed active minutes as the rateio denominator.
+ *
+ * @param {Store} store
+ * @param {import('./domain.js').Config} config
+ * @param {{ atMs?: number|null, monthStartMs?: number, monthEndMs?: number }} [opts]
+ * @returns {Lens}
+ */
+export function actualLens(store, config, opts = {}) {
+  const atMs = opts.atMs ?? null;
+  // Latest batch per recipe at-or-before atMs.
+  /** @type {Map<string, import('./domain.js').Batch>} */
+  const latest = new Map();
+  for (const b of store.batches) {
+    const t = ms(b.at);
+    if (atMs != null && t > atMs) continue;
+    const prev = latest.get(b.recipeId);
+    if (!prev || t >= ms(prev.at)) latest.set(b.recipeId, b);
+  }
+
+  // Month's actual active minutes, summed from batches in [monthStart, monthEnd).
+  let totalActive = 0;
+  let totalProduction = 0;
+  if (opts.monthStartMs != null && opts.monthEndMs != null) {
+    for (const b of store.batches) {
+      const t = ms(b.at);
+      if (t < opts.monthStartMs || t >= opts.monthEndMs) continue;
+      const r = store.recipes.get(b.recipeId);
+      totalActive += b.activeMinutes ?? r?.activeMinutes ?? 0;
+      totalProduction += b.productionMinutes ?? r?.productionMinutes ?? ((b.activeMinutes ?? r?.activeMinutes ?? 0) + (b.ovenMinutes ?? r?.ovenMinutes ?? 0));
+    }
+  }
+
+  return {
+    priceAt: atMs,
+    yieldOf: (r) => latest.get(r.id)?.yieldActual ?? r.yieldNominal,
+    timesOf: (r) => {
+      const b = latest.get(r.id);
+      return {
+        active: b?.activeMinutes ?? r.activeMinutes,
+        oven: b?.ovenMinutes ?? r.ovenMinutes,
+        production: b?.productionMinutes ?? r.productionMinutes ?? ((b?.activeMinutes ?? r.activeMinutes ?? 0) + (b?.ovenMinutes ?? r.ovenMinutes ?? 0)),
+      };
+    },
+    totalActiveMinutesMonth: totalActive || config.expectedActiveMinutesMonth,
+    totalProductionMinutesMonth: totalProduction || config.expectedProductionMinutesMonth || config.expectedActiveMinutesMonth,
+  };
+}
+
+// ── Cost roll-up (§4.1–4.3) ───────────────────────────────────────────────────
+//
+// The DAG roll-up is unified across ALL FOUR cost dimensions, not just ingredients.
+// The spec spells out CMV roll-up explicitly (§4.1) and is silent on labor/gas/fixed —
+// but `Batch` events are per-recipe (a `massa` fornada logs its OWN active/oven minutes,
+// and that massa is reused across many bolos), so a bolo's true cost must absorb the
+// massa's per-gram labor/gas/fixed scaled by how much massa it consumes. Rolling up only
+// ingredients would make every sub-recipe's baking time vanish and underprice the product.
+//
+// So each recipe contributes its OWN per-unit ingredients/labor/gas/fixed, plus, for every
+// sub-recipe component, that sub's full per-unit breakdown scaled by (qty consumed / yield).
+
+/**
+ * @typedef {object} Breakdown
+ * @property {number} ingredients  // CMV per yield-unit (the rolled-up §4.1 figure)
+ * @property {number} labor        // mao de obra, per yield-unit
+ * @property {number} gas          // oven gas, per yield-unit
+ * @property {number} fixed        // allocated fixed cost (rateio), per yield-unit
+ */
+
+/**
+ * Full per-yield-unit cost breakdown of a recipe, rolling the component DAG. Cycle-guarded:
+ * a recipe may not, directly or transitively, contain itself (§2.2).
+ *
+ *   labor = valorHora * (activeMinutes / 60) / yield   // active time only, in HOURS
+ *   gas   = taxaGas   *  ovenMinutes        / yield     // oven priced by the minute
+ *
+ * Note: the spec's §4.2 labor line wrote `activeMinutes * valorHora`, mixing minutes with a
+ * per-hour rate (off by 60x). `valorHora` is BRL/hour here, so active minutes / 60. Gas is
+ * consistent — `taxaGas` is BRL/minute.
+ *
+ * @param {Store} store @param {string} recipeId
+ * @param {import('./domain.js').Config} config @param {Lens} lens
+ * @param {Set<string>} [stack]  // recipes currently being expanded (cycle guard)
+ * @returns {Breakdown}
+ */
+export function costBreakdown(store, recipeId, config, lens, stack = new Set()) {
+  const recipe = store.recipes.get(recipeId);
+  if (!recipe) throw new RefError('recipe', recipeId);
+  if (stack.has(recipeId)) throw new CycleError([...stack, recipeId]);
+  stack.add(recipeId);
+
+  const yield_ = yieldOrThrow(recipe, lens);
+  const { active, oven, production = active + oven } = lens.timesOf(recipe);
+
+  // The recipe's own (non-component) costs.
+  const out = {
+    ingredients: 0,
+    packaging: 0,
+    labor: (config.valorHora * (active / 60)) / yield_,
+    gas: (config.taxaGas * oven) / yield_,
+    fixed: fixedShare(config, lens, production) / yield_,
+  };
+
+  for (const c of recipe.components) {
+    if (c.ref.kind === 'ingredient') {
+      const ing = store.ingredients.get(c.ref.id);
+      if (!ing) throw new RefError('ingredient', c.ref.id);
+      const qtyInStock = convert(c.qty, c.unit, ing.stockUnit, ing.conversions);
+      out[c.purpose === 'packaging' ? 'packaging' : 'ingredients'] += (qtyInStock * priceOf(store, ing.id, lens.priceAt)) / yield_;
+    } else {
+      const sub = store.recipes.get(c.ref.id);
+      if (!sub) throw new RefError('recipe', c.ref.id);
+      const subPerUnit = costBreakdown(store, sub.id, config, lens, stack);
+      // Sub-yield-units consumed per one unit of THIS recipe.
+      const qtyInYield = convert(c.qty, c.unit, sub.yieldUnit); // recipe refs use built-in units only
+      const share = qtyInYield / yield_;
+      out.ingredients += subPerUnit.ingredients * share;
+      out.packaging += (subPerUnit.packaging || 0) * share;
+      out.labor += subPerUnit.labor * share;
+      out.gas += subPerUnit.gas * share;
+      out.fixed += subPerUnit.fixed * share;
+    }
+  }
+
+  stack.delete(recipeId);
+  return out;
+}
+
+/**
+ * Fixed-cost share for one BATCH's worth of a recipe (BRL, pre-division by yield). MEI:
+ * the monthly pool already absorbs the DAS (a fixed amount, not a percentage), so it never
+ * enters the markup divisor (§4.3).
+ *
+ * Fixed costs are allocated by the recipe's total production/preparation time. Active minutes
+ * remain a separate labor-effort diagnostic and do not drive this share.
+ *
+ * @param {import('./domain.js').Config} config @param {Lens} lens
+ * @param {number} production
+ * @returns {number}
+ */
+function fixedShare(config, lens, production) {
+  const denominator = lens.totalProductionMinutesMonth || lens.totalActiveMinutesMonth;
+  if (denominator <= 0) return 0;
+  return (config.custosFixosMes * production) / denominator;
+}
+
+/**
+ * CMV per yield-unit (the §4.1 figure): rolled-up ingredient cost / yield.
+ * "The cookie that burned is paid for by the eleven that survived."
+ * @param {Store} store @param {string} recipeId
+ * @param {import('./domain.js').Config} config @param {Lens} lens
+ * @returns {number}
+ */
+export function cmvPerUnit(store, recipeId, config, lens) {
+  const d = costBreakdown(store, recipeId, config, lens);
+  return d.ingredients + d.packaging;
+}
+
+/**
+ * Full unit cost of a recipe's yield-unit: ingredients + gas + fixed. Labor remains visible in
+ * the breakdown as a diagnostic, but payroll is already part of the fixed-cost pool.
+ * @param {Store} store @param {string} recipeId
+ * @param {import('./domain.js').Config} config @param {Lens} lens
+ * @returns {number}
+ */
+export function recipeUnitCost(store, recipeId, config, lens) {
+  const d = costBreakdown(store, recipeId, config, lens);
+  return d.ingredients + d.packaging + d.gas + d.fixed;
+}
+
+/**
+ * The components of a product, tolerating the legacy `recipeId` + `portion` shape (migrated to a
+ * single `recipe` component) so the engine is robust even on un-migrated raw data.
+ * @param {import('./domain.js').Product} product
+ * @returns {import('./domain.js').ProductComponent[]}
+ */
+export function productComponents(product) {
+  if (Array.isArray(product.components)) return product.components;
+  if (product.recipeId) return [{ kind: 'recipe', id: product.recipeId, qty: product.portion ?? 1 }];
+  return [];
+}
+
+/**
+ * Per-yield-unit cost breakdown of a PRODUCT (excluding packaging), rolling up its component DAG:
+ * recipes contribute their breakdown, sub-products recurse, bought ingredients are pure ingredient
+ * cost. Cycle-guarded — a product may not, directly or transitively, contain itself.
+ *
+ * @param {Store} store @param {string} productId
+ * @param {import('./domain.js').Config} config @param {Lens} lens
+ * @param {Set<string>} [stack]
+ * @returns {Breakdown}
+ */
+export function productBreakdown(store, productId, config, lens, stack = new Set()) {
+  const product = store.products.get(productId);
+  if (!product) throw new RefError('product', productId);
+  if (stack.has(productId)) throw new CycleError([...stack, productId]);
+  stack.add(productId);
+
+  // 5th dimension `packaging` accumulates SUB-products' packaging (the product's OWN packaging is
+  // added by productUnitCost / shown separately). Recipes contribute 0 packaging.
+  const out = { ingredients: 0, labor: 0, gas: 0, fixed: 0, packaging: 0 };
+  for (const c of productComponents(product)) {
+    const qty = Number(c.qty) || 0;
+    if (c.kind === 'recipe') {
+      addScaled(out, costBreakdown(store, c.id, config, lens), qty);
+    } else if (c.kind === 'product') {
+      const sub = store.products.get(c.id);
+      if (!sub) throw new RefError('product', c.id);
+      addScaled(out, productBreakdown(store, c.id, config, lens, stack), qty); // sub's components (incl. its sub-packaging)
+      out.packaging += (Number(sub.packagingCost) || 0) * qty;                 // + sub's OWN packaging
+    } else if (c.kind === 'ingredient') {
+      const ing = store.ingredients.get(c.id);
+      if (!ing) throw new RefError('ingredient', c.id);
+      out.ingredients += priceOf(store, ing.id, lens.priceAt) * qty; // qty is in the ingredient's stockUnit
+    } else {
+      throw new RefError('component', String(c.kind));
+    }
+  }
+
+  stack.delete(productId);
+  return out;
+}
+
+function addScaled(out, b, q) {
+  out.ingredients += (b.ingredients || 0) * q;
+  out.labor += (b.labor || 0) * q;
+  out.gas += (b.gas || 0) * q;
+  out.fixed += (b.fixed || 0) * q;
+  if ('packaging' in out) out.packaging += (b.packaging || 0) * q;
+}
+
+/**
+ * Unit cost of a PRODUCT: the rolled-up component cost (incl. sub-products' packaging) plus its
+ * own packaging.
+ * @param {Store} store @param {string} productId
+ * @param {import('./domain.js').Config} config @param {Lens} lens
+ * @returns {number}
+ */
+export function productUnitCost(store, productId, config, lens) {
+  const product = store.products.get(productId);
+  if (!product) throw new RefError('product', productId);
+  const b = productBreakdown(store, productId, config, lens);
+  return b.ingredients + b.gas + b.fixed + b.packaging + (Number(product.packagingCost) || 0);
+}
+
+/**
+ * Suggested price from a unit cost (§4.4):
+ *   price = unitCost / (1 - paymentFeePct - commissionPct - salesTaxPct - targetMarginPct)
+ * Payment fee, sales commission, tax proportional to sales and target margin go in the divisor.
+ * The fixed MEI DAS is already in the fixed cost pool, so salesTaxPct must exclude it.
+ *
+ * @param {number} unitCost
+ * @param {{ paymentFeePct: number, targetMarginPct: number, commissionPct?: number, salesTaxPct?: number }} config
+ * @returns {number}
+ */
+export function priceFromCost(unitCost, config) {
+  const commission = Number(config.commissionPct) || 0;
+  const salesTax = Number(config.salesTaxPct) || 0;
+  const divisor = 1 - config.paymentFeePct - commission - salesTax - config.targetMarginPct;
+  if (divisor <= 0) throw new MarkupError(config.paymentFeePct, config.targetMarginPct, commission, salesTax);
+  return unitCost / divisor;
+}
+
+/** Percentages charged on a sale, using product-specific values when present. */
+export function effectiveSalesRates(product, config) {
+  const paymentFeePct = Number(product?.paymentFeePct ?? config.paymentFeePct) || 0;
+  const commissionPct = Number(product?.commissionPct ?? config.commissionPct) || 0;
+  const salesTaxPct = Number(product?.salesTaxPct ?? config.salesTaxPct) || 0;
+  return { paymentFeePct, commissionPct, salesTaxPct, total: paymentFeePct + commissionPct + salesTaxPct };
+}
+
+/**
+ * Convenience: the suggested price for a product under a lens.
+ * @param {Store} store @param {string} productId
+ * @param {import('./domain.js').Config} config @param {Lens} lens
+ * @returns {{ unitCost: number, price: number }}
+ */
+export function productPrice(store, productId, config, lens) {
+  const unitCost = productUnitCost(store, productId, config, lens);
+  // A product may override the margin and sales percentages; unset values use config defaults.
+  const product = store.products.get(productId);
+  const margin = product && product.targetMarginPct != null ? product.targetMarginPct : config.targetMarginPct;
+  return { unitCost, price: priceFromCost(unitCost, { ...config, ...effectiveSalesRates(product, config), targetMarginPct: margin }) };
+}
+
+/** The effective target margin for a product (its override, or the global config default). */
+export function effectiveMargin(store, productId, config) {
+  const product = store.products.get(productId);
+  return product && product.targetMarginPct != null ? product.targetMarginPct : config.targetMarginPct;
+}
+
+// ── Helpers & errors ──────────────────────────────────────────────────────────
+
+function yieldOrThrow(recipe, lens) {
+  const y = lens.yieldOf(recipe);
+  if (!(y > 0)) throw new YieldError(recipe.id, y);
+  return y;
+}
+
+export class RefError extends Error {
+  /** @param {string} kind @param {string} id */
+  constructor(kind, id) {
+    super(`${kind} nao encontrado: "${id}"`);
+    this.name = 'RefError';
+    this.kind = kind;
+    this.id = id;
+  }
+}
+
+export class CycleError extends Error {
+  /** @param {string[]} path */
+  constructor(path) {
+    super(`Ciclo de receitas: ${path.join(' -> ')}`);
+    this.name = 'CycleError';
+    this.path = path;
+  }
+}
+
+export class PriceError extends Error {
+  /** @param {string} ingredientId */
+  constructor(ingredientId) {
+    super(`Sem preco registrado para o insumo "${ingredientId}".`);
+    this.name = 'PriceError';
+    this.ingredientId = ingredientId;
+  }
+}
+
+export class YieldError extends Error {
+  /** @param {string} recipeId @param {number} value */
+  constructor(recipeId, value) {
+    super(`Rendimento invalido (${value}) para a receita "${recipeId}".`);
+    this.name = 'YieldError';
+    this.recipeId = recipeId;
+    this.value = value;
+  }
+}
+
+export class MarkupError extends Error {
+  /** @param {number} fee @param {number} margin @param {number} [commission] @param {number} [salesTax] */
+  constructor(fee, margin, commission = 0, salesTax = 0) {
+    super(
+      `Taxa (${fee}) + comissao (${commission}) + imposto (${salesTax}) + margem (${margin}) >= 100% — preco impossivel. ` +
+      `Reduza a margem ou os percentuais sobre a venda.`,
+    );
+    this.name = 'MarkupError';
+    this.fee = fee;
+    this.margin = margin;
+    this.commission = commission;
+    this.salesTax = salesTax;
+  }
+}

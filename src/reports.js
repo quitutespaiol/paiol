@@ -1,0 +1,415 @@
+// paiol — reporting aggregations (Rev 06: CASH BASIS). Pure functions over a PaiolStore; no DOM,
+// no I/O — unit-testable. The UI (Relatórios) renders these.
+//
+// The monthly RESULT is a pure cash ledger and NEVER uses the recipe/product unit cost (that lives
+// only in pricing — Preços/Simulador). This separation is what guarantees no double-counting (§9):
+//   Saldo operacional de caixa = Receitas recebidas − pagamentos realizados.
+// Perdas sem pagamento no momento do registro não saem do caixa; ficam como indicador gerencial
+// de produção. Isso evita contar novamente o valor de um insumo cuja compra já foi paga.
+// Receita is recognized when RECEIVED (walk-up sales are paid on the spot; encomenda payments when
+// they land); despesas/perdas when lançadas. The per-PRODUCT analysis (productSummary) DOES use the
+// recipe cost — but ONLY as an ESTIMATE for "which products earn most" (a decision tool), never in
+// the cash result.
+
+import { estimateLens, productUnitCost, effectiveSalesRates } from './cost-engine.js';
+import { managerialDre } from './dre.js';
+import { bundleProductItems, isBundleProduct, orderItemGross, orderItemSaleLines, saleNet } from './bundles.js';
+import { canonicalCategoryId, titleState } from './finance.js';
+
+// User-entered dates are calendar dates; timestamped events use the user's local day.
+// Slicing a UTC timestamp makes sales after 21:00 in Brazil appear on the next day.
+const day = (iso) => {
+  const value = String(iso || '');
+  if (!value.includes('T')) return value.slice(0, 10);
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return value.slice(0, 10);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+};
+const ym = (iso) => day(iso).slice(0, 7); // 'YYYY-MM'
+const inPeriod = (iso, start, end) => (!start || day(iso) >= start) && (!end || day(iso) <= end);
+
+/**
+ * Cash-basis monthly result + reference figures.
+ * @param {import('./store.js').PaiolStore} store @param {string} month 'YYYY-MM'
+ */
+export function monthSummary(store, month) {
+  // Receitas recebidas: walk-up sales (paid on the spot) + encomenda payments that landed this month.
+  let recebidoVendas = 0; let unidades = 0;
+  for (const s of store.state.sales) {
+    if (ym(s.at) !== month || store.isReversed('sale', s.id)) continue;
+    recebidoVendas += saleNet(s);
+    unidades += s.qty;
+  }
+  let recebidoPagamentos = 0;
+  for (const pg of store.state.payments) {
+    if (ym(pg.at) !== month || store.isReversed('payment', pg.id)) continue;
+    recebidoPagamentos += pg.valor || 0;
+  }
+  let recebidoOutrasReceitas = 0;
+  for (const income of store.state.incomes || []) {
+    if (ym(income.at) !== month || store.isReversed('income', income.id)) continue;
+    recebidoOutrasReceitas += income.valor || 0;
+  }
+  let recebidoFinanceiro = 0;
+  for (const st of store.state.financeSettlements || []) {
+    if (ym(st.at) !== month || store.isReversed('financeSettlement', st.id)) continue;
+    if (['discount', 'credit', 'loss', 'client-payment-allocation'].includes(st.kind)) continue;
+    const title = store.get('financeTitles', st.titleId);
+    if (title?.direction === 'receber') recebidoFinanceiro += st.amount || 0;
+  }
+  for (const payment of store.state.cashAdjustments || []) {
+    if (payment.kind !== 'client-payment' || ym(payment.at) !== month || store.isReversed('cashAdjustment', payment.id)) continue;
+    recebidoFinanceiro += Number(payment.amount) || 0;
+  }
+  const recebido = recebidoVendas + recebidoPagamentos + recebidoOutrasReceitas + recebidoFinanceiro;
+
+  // Despesas lançadas this month, split by the category's kind (default → variável).
+  let despVar = 0; let despFix = 0; let custos = 0;
+  for (const d of store.state.despesas) {
+    if (ym(d.at) !== month || store.isReversed('despesa', d.id)) continue;
+    const kind = store.get('categories', canonicalCategoryId(store, d.categoryId))?.kind;
+    if (kind === 'despesaFixa') despFix += d.valor || 0;
+    else if (kind === 'custo') custos += d.valor || 0;
+    else despVar += d.valor || 0;
+  }
+  // Legacy ad-hoc variable costs (pre-Rev 06) fold into variável so nothing is lost.
+  for (const v of store.state.variableCosts) {
+    if (ym(v.at) === month && !store.isReversed('variableCost', v.id)) despVar += v.amount || 0;
+  }
+  let pagoFinanceiro = 0;
+  for (const st of store.state.financeSettlements || []) {
+    if (ym(st.at) !== month || store.isReversed('financeSettlement', st.id)) continue;
+    if (['discount', 'loss'].includes(st.kind)) continue;
+    const title = store.get('financeTitles', st.titleId); if (title?.direction !== 'pagar') continue;
+    const category = store.get('categories', canonicalCategoryId(store, title.categoryId)); const value = st.amount || 0;
+    pagoFinanceiro += value;
+    if (category?.nature === 'custo' || category?.kind === 'custo') custos += value;
+    else if (category?.kind === 'despesaFixa' || category?.behavior === 'fixa') despFix += value;
+    else despVar += value;
+  }
+  let perdas = 0;
+  for (const p of store.state.perdas) {
+    if (ym(p.at) === month && !store.isReversed('perda', p.id)) perdas += p.amount || 0;
+  }
+  const despesas = despVar + despFix + custos;
+  const saldoCaixa = recebido - despesas;
+  const lucro = saldoCaixa; // alias legado; a interface usa o nome correto "saldo de caixa".
+
+  // Reference (accrual): what you sold/delivered this month, and what is still owed (current total).
+  let faturado = recebidoVendas; // walk-up sales are also "faturado" in their month
+  for (const e of store.state.encomendas) if (!e.desistenciaAt && ym(e.quickSale ? e.at : e.deliveryDate) === month) faturado += e.total || 0;
+  let aReceber = 0;
+  for (const e of store.state.encomendas) {
+    if (e.desistenciaAt) continue;
+    const title = store.state.financeTitles.find((t) => t.sourceType === 'encomenda' && t.sourceId === e.id);
+    const saldo = title ? titleState(store, title).balance : (e.total || 0) - store.paidFor(e.id);
+    if (saldo > 0.005) aReceber += saldo;
+  }
+  for (const t of store.state.financeTitles || []) {
+    if (t.direction !== 'receber' || t.sourceType === 'encomenda' || t.cancelledAt) continue;
+    const saldo = titleState(store, t).balance;
+    if (saldo > 0.005) aReceber += saldo;
+  }
+
+  return {
+    month, recebido, recebidoVendas, recebidoPagamentos, recebidoOutrasReceitas, recebidoFinanceiro,
+    despVar, despFix, custos, pagoFinanceiro, perdas, despesas, saldoCaixa, lucro,
+    faturado, aReceber, unidades,
+    margem: recebido > 0 ? lucro / recebido : 0,
+  };
+}
+
+/** Despesas grouped by category for the month, biggest first; folds legacy costs into a bucket. */
+export function despesasByCategory(store, month) {
+  const map = new Map();
+  for (const d of store.state.despesas) {
+    if (ym(d.at) !== month || store.isReversed('despesa', d.id)) continue;
+    const categoryId = canonicalCategoryId(store, d.categoryId) || '__sem__';
+    map.set(categoryId, (map.get(categoryId) || 0) + (d.valor || 0));
+  }
+  for (const st of store.state.financeSettlements || []) {
+    if (ym(st.at) !== month || store.isReversed('financeSettlement', st.id)) continue;
+    if (['discount', 'loss'].includes(st.kind)) continue;
+    const title = store.get('financeTitles', st.titleId);
+    if (title?.direction !== 'pagar') continue;
+    const categoryId = canonicalCategoryId(store, title.categoryId) || '__sem__';
+    map.set(categoryId, (map.get(categoryId) || 0) + (st.amount || 0));
+  }
+  const rows = [...map.entries()].map(([id, total]) => {
+    const c = store.get('categories', id);
+    return { id, name: c?.name || '(sem categoria)', kind: c?.kind || 'despesaVariavel', total };
+  });
+  let legacy = 0;
+  for (const v of store.state.variableCosts) if (ym(v.at) === month && !store.isReversed('variableCost', v.id)) legacy += v.amount || 0;
+  if (legacy > 0) rows.push({ id: '__legacy__', name: 'Outras (lançamentos antigos)', kind: 'despesaVariavel', total: legacy });
+  return rows.sort((a, b) => b.total - a.total);
+}
+
+/**
+ * Per-product analysis for the month (walk-up sales + encomenda items delivered this month):
+ * [{ id, name, qty, faturamento, lucroEstimado }]. `lucroEstimado` uses the recipe unit cost as an
+ * ESTIMATE (decision tool — "which products earn most"); it is NOT the cash result. Caller sorts.
+ */
+export function productSummary(store, month) {
+  const config = store.getConfig();
+  const es = store.toEngineStore();
+  const lens = estimateLens(config);
+  const unitCost = (pid) => { try { return productUnitCost(es, pid, config, lens); } catch { return 0; } };
+  const map = new Map();
+  const add = (pid, qty, revenue, costPerUnit = null) => {
+    const e = map.get(pid) || { qty: 0, faturamento: 0, custoEst: 0 };
+    e.qty += qty; e.faturamento += revenue; e.custoEst += qty * (costPerUnit ?? unitCost(pid));
+    map.set(pid, e);
+  };
+  for (const s of store.state.sales) {
+    if (ym(s.at) !== month || store.isReversed('sale', s.id)) continue;
+    add(s.productId, s.qty, saleNet(s));
+  }
+  for (const e of store.state.encomendas) {
+    if (e.desistenciaAt || ym(e.quickSale ? e.at : e.deliveryDate) !== month) continue;
+    const itemGross = (e.itens || []).reduce((sum, item) => sum + orderItemGross(item), 0);
+    const discountFactor = itemGross > 0 ? Math.max(0, itemGross - (Number(e.discount) || 0)) / itemGross : 1;
+    for (const it of e.itens || []) for (const line of orderItemSaleLines(it)) {
+      const parent = store.get('products', it.productId);
+      const replaced = line.productId === it.productId && isBundleProduct(parent) && Array.isArray(it.bundleItems);
+      const parentCost = replaced ? Math.max(0, unitCost(it.productId) - bundleProductItems(parent).reduce((sum, child) => sum + child.qty * unitCost(child.productId), 0)) : null;
+      add(line.productId, line.qty, line.total * discountFactor, parentCost);
+    }
+  }
+  return [...map.entries()].map(([id, e]) => ({
+    id, name: store.get('products', id)?.name || '(produto removido)',
+    qty: e.qty, faturamento: e.faturamento, lucroEstimado: e.faturamento - e.custoEst,
+  }));
+}
+
+/** Per-client totals for the month (from encomendas delivered), biggest spender first. */
+export function clientSummary(store, month) {
+  const map = new Map();
+  for (const e of store.state.encomendas) {
+    if (e.desistenciaAt || ym(e.quickSale ? e.at : e.deliveryDate) !== month) continue;
+    const key = e.clienteId || '__sem__';
+    const c = map.get(key) || { total: 0, recebido: 0, n: 0 };
+    c.total += e.total || 0; c.recebido += store.paidFor(e.id); c.n += 1;
+    map.set(key, c);
+  }
+  return [...map.entries()].map(([id, c]) => ({
+    id, name: id === '__sem__' ? 'Sem cliente' : (store.get('clients', id)?.name || '(removido)'),
+    total: c.total, recebido: c.recebido, saldo: c.total - c.recebido, n: c.n,
+  })).sort((a, b) => b.total - a.total);
+}
+
+/**
+ * The `n` month keys ending at `month` (oldest first). Deterministic — no "now" dependency.
+ * @param {string} month 'YYYY-MM' @param {number} n @returns {string[]}
+ */
+export function monthsEndingAt(month, n) {
+  const [y, m] = month.split('-').map(Number);
+  const out = [];
+  for (let i = n - 1; i >= 0; i--) {
+    const d = new Date(y, (m - 1) - i, 1);
+    out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
+  }
+  return out;
+}
+
+/** Recebido + lucro per month over a trailing window, for the evolution chart. */
+export function revenueTrend(store, month, n = 6) {
+  return monthsEndingAt(month, n).map((mo) => {
+    const s = monthSummary(store, mo);
+    return { month: mo, recebido: s.recebido, lucro: s.lucro };
+  });
+}
+
+const trendDate = (value) => new Date(`${value}T12:00:00`);
+const trendDay = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+const trendAddDays = (value, days) => { const date = trendDate(value); date.setDate(date.getDate() + days); return trendDay(date); };
+
+/** DRE net-result evolution using daily, weekly or monthly buckets according to the chosen period. */
+export function businessProfitTrend(store, start, end) {
+  if (!start || !end || start > end) return [];
+  const span = Math.round((trendDate(end) - trendDate(start)) / 86400000) + 1;
+  const buckets = [];
+  if (span <= 31) {
+    for (let cursor = start; cursor <= end; cursor = trendAddDays(cursor, 1)) buckets.push({ start: cursor, end: cursor, label: cursor.slice(8, 10) + '/' + cursor.slice(5, 7) });
+  } else if (span <= 120) {
+    for (let cursor = start; cursor <= end;) {
+      const nextEnd = trendAddDays(cursor, 6);
+      const bucketEnd = nextEnd > end ? end : nextEnd;
+      buckets.push({ start: cursor, end: bucketEnd, label: cursor.slice(8, 10) + '/' + cursor.slice(5, 7) });
+      cursor = trendAddDays(bucketEnd, 1);
+    }
+  } else {
+    let cursor = start;
+    while (cursor <= end) {
+      const date = trendDate(cursor);
+      const monthEnd = new Date(date.getFullYear(), date.getMonth() + 1, 0, 12);
+      const bucketEnd = trendDay(monthEnd) > end ? end : trendDay(monthEnd);
+      buckets.push({ start: cursor, end: bucketEnd, label: `${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getFullYear()).slice(2)}` });
+      cursor = trendAddDays(bucketEnd, 1);
+    }
+  }
+  return buckets.map((bucket) => ({ ...bucket, profit: managerialDre(store, bucket.start, bucket.end).netResult }));
+}
+
+/**
+ * Commercial decision indicators for an inclusive period. Sales volume is recognized on the sale
+ * date (walk-up) or scheduled delivery date (orders). Margins are estimates using the current
+ * technical sheet; they are deliberately separate from realized cash.
+ */
+export function businessPeriodSummary(store, start, end) {
+  const config = store.getConfig();
+  const es = store.toEngineStore();
+  const lens = estimateLens(config);
+  const productCosts = new Map();
+  const unitCost = (id) => {
+    if (productCosts.has(id)) return productCosts.get(id);
+    let value = null;
+    const product = store.get('products', id);
+    try { if ((product?.components || []).length || Number(product?.packagingCost) > 0) value = productUnitCost(es, id, config, lens); } catch { /* incomplete technical sheet */ }
+    productCosts.set(id, value); return value;
+  };
+  // Only active catalog items count as "without sales". An inactive item is still added below if
+  // it has a historical sale in this period, preserving the truth of past reports and rankings.
+  const products = new Map(store.state.products.filter((p) => p.active !== false).map((p) => [p.id, { id: p.id, name: p.name, qty: 0, revenue: 0, cost: 0, fees: 0, costKnown: true }]));
+  const clients = new Map();
+  let basketRevenue = 0;
+  const addProduct = (id, qty, revenue, feePct, costOverride = null) => {
+    const product = store.get('products', id);
+    const row = products.get(id) || { id, name: product?.name || '(produto removido)', qty: 0, revenue: 0, cost: 0, fees: 0, costKnown: true };
+    const cost = costOverride == null ? unitCost(id) : costOverride;
+    row.qty += Number(qty) || 0; row.revenue += Number(revenue) || 0; row.fees += (Number(revenue) || 0) * (Number(feePct) || 0);
+    if (cost == null) row.costKnown = false; else row.cost += (Number(qty) || 0) * cost;
+    products.set(id, row);
+  };
+  for (const sale of store.state.sales) {
+    if (store.isReversed('sale', sale.id) || !inPeriod(sale.at, start, end)) continue;
+    const gross = (Number(sale.qty) || 0) * (Number(sale.unitPrice) || 0);
+    const rates = effectiveSalesRates(store.get('products', sale.productId), config);
+    if (isBundleProduct(store.get('products', sale.productId))) basketRevenue += saleNet(sale);
+    addProduct(sale.productId, sale.qty, Math.max(0, gross - (Number(sale.discount) || 0)),
+      (sale.paymentFeePct ?? rates.paymentFeePct) + (sale.commissionPct ?? rates.commissionPct) + (sale.salesTaxPct ?? rates.salesTaxPct));
+  }
+  for (const order of store.state.encomendas) {
+    if (order.desistenciaAt || !inPeriod(order.quickSale ? order.at : order.deliveryDate, start, end)) continue;
+    const clientId = order.clienteId || '__sem__';
+    const client = clients.get(clientId) || { id: clientId, orders: 0, total: 0 };
+    client.orders += 1; client.total += Number(order.total) || 0; clients.set(clientId, client);
+    const itemGross = (order.itens || []).reduce((sum, item) => sum + orderItemGross(item), 0);
+    const discountFactor = itemGross > 0 ? Math.max(0, itemGross - (Number(order.discount) || 0)) / itemGross : 1;
+    for (const item of order.itens || []) for (const line of orderItemSaleLines(item)) {
+      const rates = effectiveSalesRates(store.get('products', line.productId), config);
+      const parent = store.get('products', item.productId);
+      const replaced = line.productId === item.productId && isBundleProduct(parent) && Array.isArray(item.bundleItems);
+      const standardChildren = replaced ? bundleProductItems(parent) : [];
+      const standardCosts = standardChildren.map((child) => ({ qty: child.qty, cost: unitCost(child.productId) }));
+      const parentUnitCost = replaced ? unitCost(item.productId) : null;
+      const parentCost = replaced && parentUnitCost != null && standardCosts.every((child) => child.cost != null)
+        ? Math.max(0, parentUnitCost - standardCosts.reduce((sum, child) => sum + child.qty * child.cost, 0)) : null;
+      addProduct(line.productId, line.qty, line.total * discountFactor, rates.total, parentCost);
+    }
+    for (const item of order.itens || []) if (isBundleProduct(store.get('products', item.productId))) basketRevenue += orderItemGross(item) * discountFactor;
+  }
+  const productRows = [...products.values()].map((row) => {
+    const profit = row.costKnown ? row.revenue - row.cost - row.fees : null;
+    return { ...row, profit, marginPct: profit != null && row.revenue > 0 ? profit / row.revenue : null };
+  });
+  const sold = productRows.filter((p) => p.qty > 0).sort((a, b) => b.qty - a.qty || b.revenue - a.revenue);
+  const marginKnown = sold.filter((p) => p.marginPct != null).sort((a, b) => b.marginPct - a.marginPct);
+  const baskets = sold.filter((row) => isBundleProduct(store.get('products', row.id)));
+  const clientRows = [...clients.values()].map((row) => ({ ...row, name: row.id === '__sem__' ? 'Sem cliente' : (store.get('clients', row.id)?.name || '(cliente removido)') }));
+  return {
+    start, end,
+    mostFrequentClient: clientRows.slice().sort((a, b) => b.orders - a.orders || b.total - a.total)[0] || null,
+    highestValueClient: clientRows.slice().sort((a, b) => b.total - a.total || b.orders - a.orders)[0] || null,
+    mostSoldProduct: sold[0] || null,
+    leastSoldProduct: sold.slice().sort((a, b) => a.qty - b.qty || a.revenue - b.revenue)[0] || null,
+    bestMarginProduct: marginKnown[0] || null,
+    worstMarginProduct: marginKnown[marginKnown.length - 1] || null,
+    baskets,
+    basketQty: baskets.reduce((sum, p) => sum + p.qty, 0),
+    basketRevenue,
+    productsWithoutSales: productRows.filter((p) => p.qty <= 0).length,
+    soldProducts: sold,
+    clients: clientRows,
+  };
+}
+
+/**
+ * Managerial sales report for an inclusive date period. Orders are sales; legacy walk-up sales are
+ * preserved and treated as received on the spot. Delivery and payment are intentionally unrelated.
+ * `status`: todos | recebidos | naorecebidos | desistencias.
+ */
+export function salesPeriodSummary(store, start, end, status = 'todos') {
+  const cancellations = [];
+  for (const e of store.state.encomendas) {
+    if (!e.desistenciaAt || !inPeriod(e.desistenciaAt, start, end)) continue;
+    cancellations.push({
+      kind: 'encomenda', id: e.id, at: e.desistenciaAt, order: e,
+      clientId: e.clienteId || '__sem__', total: Number(e.total) || 0,
+    });
+  }
+  for (const s of store.state.sales) {
+    if (!store.isReversed('sale', s.id) || !inPeriod(s.at, start, end)) continue;
+    cancellations.push({ kind: 'sale', id: s.id, at: s.at, sale: s, clientId: '__sem__', total: Math.max(0, (Number(s.qty) || 0) * (Number(s.unitPrice) || 0) - (Number(s.discount) || 0)) });
+  }
+  cancellations.sort((a, b) => (a.at < b.at ? 1 : -1));
+
+  if (status === 'desistencias') {
+    return {
+      start, end, status, rows: [], clients: [], products: [], cancellations,
+      totalVendido: 0, totalRecebido: 0, totalPendente: 0,
+      totalDesistencias: cancellations.reduce((sum, x) => sum + x.total, 0),
+    };
+  }
+
+  const rows = [];
+  for (const e of store.state.encomendas) {
+    if (e.desistenciaAt || !inPeriod(e.quickSale ? e.at : e.deliveryDate, start, end)) continue;
+    const total = Number(e.total) || 0;
+    const title = store.state.financeTitles.find((t) => t.sourceType === 'encomenda' && t.sourceId === e.id);
+    const finance = title ? titleState(store, title) : null;
+    const received = Math.min(total, finance ? finance.paid : Math.max(0, store.paidFor(e.id)));
+    const discounted = finance?.discounted || 0;
+    const pending = finance ? finance.balance : Math.max(0, total - received);
+    const paid = pending <= 0.005;
+    if (status === 'recebidos' && !paid) continue;
+    if (status === 'naorecebidos' && paid) continue;
+    rows.push({ kind: 'encomenda', id: e.id, at: e.quickSale ? e.at : e.deliveryDate, order: e, clientId: e.clienteId || '__sem__', total, received, discounted, pending, paid });
+  }
+  for (const s of store.state.sales) {
+    if (store.isReversed('sale', s.id) || !inPeriod(s.at, start, end) || status === 'naorecebidos') continue;
+    const total = Math.max(0, (Number(s.qty) || 0) * (Number(s.unitPrice) || 0) - (Number(s.discount) || 0));
+    rows.push({ kind: 'sale', id: s.id, at: s.at, sale: s, clientId: '__sem__', total, received: total, pending: 0, paid: true });
+  }
+  rows.sort((a, b) => (a.at < b.at ? 1 : -1));
+
+  const clients = new Map();
+  const products = new Map();
+  const addClient = (id, total, received, pending) => {
+    const c = clients.get(id) || { id, total: 0, received: 0, pending: 0, orders: 0 };
+    c.total += total; c.received += received; c.pending += pending; c.orders += 1; clients.set(id, c);
+  };
+  const addProduct = (id, qty, total) => {
+    const p = products.get(id) || { id, qty: 0, total: 0 };
+    p.qty += qty; p.total += total; products.set(id, p);
+  };
+  for (const row of rows) {
+    addClient(row.clientId, row.total, row.received, row.pending);
+    if (row.kind === 'encomenda') {
+      const itemGross = (row.order.itens || []).reduce((sum, item) => sum + orderItemGross(item), 0);
+      const discountFactor = itemGross > 0 ? Math.max(0, itemGross - (Number(row.order.discount) || 0)) / itemGross : 1;
+      for (const it of row.order.itens || []) for (const line of orderItemSaleLines(it)) addProduct(line.productId, line.qty, line.total * discountFactor);
+    } else addProduct(row.sale.productId, Number(row.sale.qty) || 0, row.total);
+  }
+
+  return {
+    start, end, status, rows, cancellations,
+    totalVendido: rows.reduce((sum, x) => sum + x.total, 0),
+    totalRecebido: rows.reduce((sum, x) => sum + x.received, 0),
+    totalPendente: rows.reduce((sum, x) => sum + x.pending, 0),
+    totalDescontado: rows.reduce((sum, x) => sum + (x.discounted || 0), 0),
+    totalDesistencias: cancellations.reduce((sum, x) => sum + x.total, 0),
+    clients: [...clients.values()].map((c) => ({ ...c, name: c.id === '__sem__' ? 'Sem cliente' : (store.get('clients', c.id)?.name || '(cliente removido)') })).sort((a, b) => b.total - a.total),
+    products: [...products.values()].map((p) => ({ ...p, name: store.get('products', p.id)?.name || '(produto removido)' })).sort((a, b) => b.total - a.total),
+  };
+}

@@ -1,0 +1,18 @@
+{
+  "name": "paiol",
+  "version": "0.3.46",
+  "description": "Cost, recipe, and sales management for a Brazilian MEI confeitaria. Single-file, local-first, auditable-forever. Part of the GCU ecosystem.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Arthur Endlein Correia",
+  "scripts": {
+    "test": "node --no-warnings --test \"test/**/*.test.mjs\"",
+    "test:e2e": "node --no-warnings --test test/e2e/smoke.mjs",
+    "build": "node build.js",
+    "dev": "node tools/dev-server.js"
+  },
+  "devDependencies": {
+    "exceljs": "^4.4.0",
+    "playwright": "^1.60.0"
+  }
+}
