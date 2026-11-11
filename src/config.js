@@ -2,20 +2,20 @@
 // so it lives in the shipped file. The redirect URI must EXACTLY match one registered in the
 // Dropbox App Console; we pick by origin.
 
-// Set this to the App key of an App-folder Dropbox application owned by Quitutes do Paiol.
-// Never reuse the Gentropic application when moving the site to a new owner.
-export const DROPBOX_APP_KEY = '';
-export const APP_VERSION = '0.3.46';
+// Public App key for the App-folder Dropbox application owned by Quitutes do Paiol.
+export const DROPBOX_APP_KEY = 'tokrzn0n86oc1f7';
+export const APP_VERSION = '0.3.47';
 export const APP_URL = 'https://quitutespaiol.github.io/paiol/';
 
-// Where Dropbox stores everything (App-folder app → relative to /Apps/Paiol/).
+// Where Dropbox stores everything (relative to this app's own Dropbox folder).
 export const REMOTE_BUSINESS_PATH = '/business.yaml';
 // Local IndexedDB database name (via @gcu/vfs idb backend).
 export const LOCAL_DB_NAME = 'paiol';
 
 /**
- * The OAuth redirect URI for the current origin. Must be registered verbatim in the App Console:
- *   - http://localhost:8080/        (local dev — served by tools/dev-server.js)
+ * The OAuth redirect URI for the current origin. Production is registered verbatim in the
+ * Dropbox App Console. Register localhost separately before testing Dropbox in local dev:
+ *   - http://localhost:8080/        (optional local dev)
  *   - https://quitutespaiol.github.io/paiol/  (GitHub Pages)
  * @returns {string}
  */

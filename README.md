@@ -13,8 +13,8 @@ npm test         # run the test suite (node --test, zero deps)
 npm run build    # inline everything → paiol.html (single-file deploy)
 ```
 
-Open <http://localhost:8080/> — that exact URL is also the registered Dropbox OAuth
-redirect, so "Conectar ao Dropbox" works in local dev.
+Open <http://localhost:8080/>. To test Dropbox in local development, register that exact
+URL as an additional OAuth redirect in the Dropbox App Console.
 
 ## Deploy
 
@@ -23,12 +23,14 @@ Live at <https://quitutespaiol.github.io/paiol/> via GitHub Pages — a project 
 to `main` runs [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml), which builds
 the single file and publishes it (no manual steps, no separate hosting repo).
 
-The single file is self-contained (everything inlined). Before enabling Dropbox, create an
-App-folder Dropbox application owned by Quitutes do Paiol, enable `files.content.read`,
-`files.content.write` and `files.metadata.read`, register the exact OAuth redirect
-`https://quitutespaiol.github.io/paiol/`, and put its public App key in `src/config.js`.
-The old Gentropic Dropbox App key must not be reused. Business data is never committed to
-GitHub; import the complete YAML backup in Ajustes on the new site before connecting Dropbox.
+The single file is self-contained (everything inlined). Dropbox uses the scoped App-folder
+application **Quitutes do Paiol**, owned by the Paiol Dropbox account. Its public App key is
+in `src/config.js`; no App secret or access token belongs in the repository. The exact OAuth
+redirect `https://quitutespaiol.github.io/paiol/` is registered, and the application has
+`files.content.read`, `files.content.write` and `files.metadata.read` only. Business data is
+never committed to GitHub. The complete YAML backup was restored on the new site before
+connecting this Dropbox application; its own folder starts empty and receives the local data
+on first synchronization. The old PaiolManager folder remains separate.
 
 ## Layout
 
